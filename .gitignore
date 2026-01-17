@@ -1,0 +1,17 @@
+# Node
+node_modules/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+.env
+
+# Uploaded videos / storage
+storage/
+
+# OS
+.DS_Store
+
+# Vite
+.vite/
