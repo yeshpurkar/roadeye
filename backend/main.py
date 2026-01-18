@@ -1,75 +1,30 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 import os
-import uuid
-import time
-import json
-from pathlib import Path
-from typing import Optional, Dict, Any, List
-from threading import Lock
+import requests
+from typing import Optional, List, Dict, Any
+
+from services.r2 import presign_put, presign_get, put_json, get_json
+from services.jobs import create_job, get_job, save_job, results_key, video_key as make_video_key
+
 
 app = FastAPI(title="RoadEye API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # OK for local dev; tighten later
+    allow_origins=["*"],  # OK for POC; tighten later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-STORAGE_DIR = Path(os.getenv("STORAGE_DIR", "./storage")).resolve()
-STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-JOBS_PATH = STORAGE_DIR / "jobs.json"
-JOBS_LOCK = Lock()
-
-
-def _now() -> float:
-    return time.time()
-
-
-def _load_jobs() -> Dict[str, Any]:
-    if not JOBS_PATH.exists():
-        return {}
-    try:
-        return json.loads(JOBS_PATH.read_text())
-    except Exception:
-        # If jobs.json is corrupted, fail safe to empty (you can restore later)
-        return {}
-
-
-def _save_jobs(jobs: Dict[str, Any]) -> None:
-    tmp = STORAGE_DIR / "jobs.json.tmp"
-    tmp.write_text(json.dumps(jobs, indent=2))
-    tmp.replace(JOBS_PATH)
-
-
-def _get_job(job_id: str) -> Optional[Dict[str, Any]]:
-    with JOBS_LOCK:
-        jobs = _load_jobs()
-        j = jobs.get(job_id)
-        return dict(j) if j else None
-
-
-def _set_job(job_id: str, patch: Dict[str, Any]) -> None:
-    with JOBS_LOCK:
-        jobs = _load_jobs()
-        if job_id not in jobs:
-            return
-        jobs[job_id].update(patch)
-        _save_jobs(jobs)
-
-
-def _job_dir(job_id: str) -> Path:
-    d = STORAGE_DIR / job_id
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def _results_path(job_id: str) -> Path:
-    return _job_dir(job_id) / "results.json"
+def require_env(name: str) -> str:
+    v = os.getenv(name)
+    if not v:
+        raise RuntimeError(f"Missing required env var: {name}")
+    return v
 
 
 @app.get("/health")
@@ -77,18 +32,8 @@ def health():
     return {"status": "ok"}
 
 
-# -----------------------
-# Existing Job Endpoints
-# -----------------------
-
 @app.post("/jobs")
-def create_job(payload: dict):
-    """
-    Accepts either:
-      { "asset_types": ["mileposts", ...] }   (old)
-    or
-      { "assets": ["mileposts", ...], "filename": "x.mp4" }  (frontend)
-    """
+def api_create_job(payload: dict):
     asset_types = payload.get("asset_types")
     if asset_types is None:
         asset_types = payload.get("assets")
@@ -97,37 +42,59 @@ def create_job(payload: dict):
         raise HTTPException(status_code=400, detail="assets/asset_types must be a non-empty list")
 
     filename_hint = payload.get("filename")
+    job = create_job(asset_types=asset_types, filename_hint=filename_hint)
+    return {"job_id": job["job_id"]}
 
-    job_id = str(uuid.uuid4())
-    job = {
-        "job_id": job_id,
-        "asset_types": asset_types,
-        "status": "created",
-        "video_path": None,
-        "filename_hint": filename_hint,
-        "results": None,
-        "results_path": None,
-        "error": None,
-        "created_at": _now(),
-        "started_at": None,
-        "finished_at": None,
-    }
 
-    with JOBS_LOCK:
-        jobs = _load_jobs()
-        jobs[job_id] = job
-        _save_jobs(jobs)
+@app.get("/jobs/{job_id}")
+def api_get_job(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
 
-    return {"job_id": job_id}
+
+# Canonical upload flow
+@app.post("/jobs/{job_id}/upload-url")
+def api_upload_url(job_id: str, payload: dict):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    filename = payload.get("filename") or job.get("filename_hint") or "upload.mp4"
+    content_type = payload.get("content_type") or "application/octet-stream"
+
+    key = make_video_key(job_id, filename)
+    url = presign_put(key=key, content_type=content_type, expires_seconds=3600)
+    return {"upload_url": url, "video_key": key}
+
+
+@app.post("/jobs/{job_id}/upload-complete")
+def api_upload_complete(job_id: str, payload: dict):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    vkey = payload.get("video_key")
+    if not vkey:
+        raise HTTPException(status_code=400, detail="video_key is required")
+
+    job["video_key"] = vkey
+    job["status"] = "uploaded"
+    job["error"] = None
+    save_job(job)
+
+    return {"job_id": job_id, "status": "uploaded", "video_key": vkey}
+
+
+# Keep legacy upload route working (fallback): client uploads to backend, backend writes to R2 via presign PUT
+# This avoids local disk dependency.
+from fastapi import UploadFile, File  # noqa: E402
 
 
 @app.post("/jobs/{job_id}/upload")
-async def upload_video(
-    job_id: str,
-    file: Optional[UploadFile] = File(None),   # frontend sends "file"
-    video: Optional[UploadFile] = File(None),  # old version sends "video"
-):
-    job = _get_job(job_id)
+async def legacy_upload(job_id: str, file: Optional[UploadFile] = File(None), video: Optional[UploadFile] = File(None)):
+    job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
 
@@ -135,168 +102,99 @@ async def upload_video(
     if upload is None:
         raise HTTPException(status_code=400, detail="Missing upload field: file (or video)")
 
-    ext = Path(upload.filename).suffix or ".mp4"
-    filename = f"{job_id}{ext}"
-    dest = STORAGE_DIR / filename
+    filename = upload.filename or "upload.mp4"
+    content_type = upload.content_type or "application/octet-stream"
+    key = make_video_key(job_id, filename)
+    url = presign_put(key=key, content_type=content_type, expires_seconds=3600)
 
-    # Stream to disk in chunks so large files don't explode RAM
-    try:
-        with dest.open("wb") as f:
-            while True:
-                chunk = await upload.read(1024 * 1024)  # 1MB chunks
-                if not chunk:
-                    break
-                f.write(chunk)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save upload: {e}")
+    # stream from client upload to R2 PUT
+    resp = requests.put(url, data=await upload.read(), headers={"Content-Type": content_type})
+    if not resp.ok:
+        raise HTTPException(status_code=500, detail=f"Failed to upload to R2: {resp.status_code}")
 
-    _set_job(job_id, {"video_path": str(dest), "status": "uploaded", "error": None})
-    return {"job_id": job_id, "status": "uploaded", "video_path": str(dest)}
+    job["video_key"] = key
+    job["status"] = "uploaded"
+    job["error"] = None
+    save_job(job)
+
+    return {"job_id": job_id, "status": "uploaded", "video_key": key}
 
 
-@app.get("/jobs/{job_id}")
-def get_job(job_id: str):
-    job = _get_job(job_id)
+@app.post("/jobs/{job_id}/submit")
+def api_submit(job_id: str):
+    job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
-    return job
+
+    if job.get("status") == "created":
+        raise HTTPException(status_code=400, detail="job must be uploaded before submit")
+
+    if not job.get("video_key"):
+        raise HTTPException(status_code=400, detail="job missing video_key (upload not completed)")
+
+    if job.get("status") in ("queued", "running"):
+        return {"job_id": job_id, "status": job["status"]}
+
+    if job.get("status") == "completed":
+        return {"job_id": job_id, "status": "completed"}
+
+    # mark queued before submission
+    job["status"] = "queued"
+    job["error"] = None
+    save_job(job)
+
+    runpod_api_key = require_env("RUNPOD_API_KEY")
+    endpoint_id = require_env("RUNPOD_ENDPOINT_ID")
+
+    # RunPod REST submit
+    submit_url = f"https://api.runpod.ai/v2/{endpoint_id}/run"
+    headers = {"Authorization": f"Bearer {runpod_api_key}", "Content-Type": "application/json"}
+    payload = {"input": {"job_id": job_id, "video_key": job["video_key"]}}
+
+    r = requests.post(submit_url, headers=headers, json=payload, timeout=30)
+    if not r.ok:
+        job["status"] = "failed"
+        job["error"] = f"RunPod submit failed: {r.status_code}"
+        save_job(job)
+        raise HTTPException(status_code=500, detail=job["error"])
+
+    job["status"] = "running"
+    save_job(job)
+    return {"job_id": job_id, "status": job["status"]}
 
 
+# Keep legacy route /process as alias to /submit
 @app.post("/jobs/{job_id}/process")
-def process_job(job_id: str):
-    """
-    Queue the job for the worker. The worker will set:
-      queued -> processing -> done/error
-    """
-    job = _get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="job not found")
-
-    status = job.get("status")
-
-    if status == "created":
-        raise HTTPException(status_code=400, detail="job must be uploaded before processing")
-
-    if status == "uploaded":
-        _set_job(job_id, {"status": "queued", "error": None})
-        return {"job_id": job_id, "status": "queued"}
-
-    if status in ("queued", "processing"):
-        return {"job_id": job_id, "status": status}
-
-    if status == "done":
-        results = job.get("results") or []
-        return {"job_id": job_id, "status": "done", "detections": len(results)}
-
-    if status == "error":
-        return {"job_id": job_id, "status": "error", "error": job.get("error")}
-
-    return {"job_id": job_id, "status": status or "unknown"}
-
-
-# -----------------------
-# New API Endpoints
-# -----------------------
-
-@app.get("/jobs")
-def list_jobs(
-    limit: int = 50,
-    offset: int = 0,
-    status: Optional[str] = None,
-    newest_first: bool = True,
-):
-    """
-    List jobs for UI dashboards / refresh after reload.
-
-    Query params:
-      - limit (default 50, max 500)
-      - offset (default 0)
-      - status (optional: created/uploaded/queued/processing/done/error)
-      - newest_first (default True)
-    """
-    if limit < 1:
-        raise HTTPException(status_code=400, detail="limit must be >= 1")
-    if limit > 500:
-        limit = 500
-    if offset < 0:
-        raise HTTPException(status_code=400, detail="offset must be >= 0")
-
-    with JOBS_LOCK:
-        jobs = _load_jobs()
-
-    items = list(jobs.values())
-
-    if status:
-        items = [j for j in items if (j.get("status") == status)]
-
-    # Sort by created_at (fallback 0)
-    items.sort(key=lambda j: j.get("created_at") or 0, reverse=newest_first)
-
-    total = len(items)
-    page = items[offset: offset + limit]
-
-    # Keep response light by default (results can be fetched separately)
-    for j in page:
-        if isinstance(j.get("results"), list):
-            # results might be large; leave count only
-            j["results_count"] = len(j["results"])
-            j["results"] = None
-
-    return {"total": total, "limit": limit, "offset": offset, "items": page}
+def legacy_process(job_id: str):
+    return api_submit(job_id)
 
 
 @app.get("/jobs/{job_id}/results")
-def get_job_results(job_id: str):
-    """
-    Return results JSON. Source order:
-      1) /storage/<job_id>/results.json
-      2) job["results"] in jobs.json
-    """
-    job = _get_job(job_id)
+def api_results(job_id: str):
+    job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
 
-    rp = _results_path(job_id)
-    if rp.exists():
-        try:
-            data = json.loads(rp.read_text())
-            return {"job_id": job_id, "results": data}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to read results.json: {e}")
+    rk = job.get("results_key") or results_key(job_id)
+    data = get_json(rk)
 
-    if isinstance(job.get("results"), list):
-        return {"job_id": job_id, "results": job["results"]}
-
-    # If not done yet, return useful status instead of 404
     status = job.get("status")
-    if status in ("queued", "processing", "uploaded", "created"):
-        return JSONResponse(
-            status_code=202,
-            content={"job_id": job_id, "status": status, "message": "Results not ready yet"},
-        )
+    if data is None:
+        if status in ("created", "uploaded", "queued", "running"):
+            return JSONResponse(status_code=202, content={"job_id": job_id, "status": status, "message": "Results not ready yet"})
+        if status == "failed":
+            raise HTTPException(status_code=500, detail=job.get("error") or "job failed")
+        raise HTTPException(status_code=404, detail="results not found")
 
-    if status == "error":
-        raise HTTPException(status_code=500, detail=job.get("error") or "job failed")
-
-    raise HTTPException(status_code=404, detail="results not found")
+    return {"job_id": job_id, "results": data}
 
 
 @app.get("/jobs/{job_id}/video")
-def get_job_video(job_id: str):
-    """
-    Stream the uploaded video back (debug endpoint).
-    """
-    job = _get_job(job_id)
+def api_video(job_id: str):
+    job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
-
-    vp = job.get("video_path")
-    if not vp:
+    vkey = job.get("video_key")
+    if not vkey:
         raise HTTPException(status_code=404, detail="video not uploaded")
-
-    path = Path(vp)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="video file missing on disk")
-
-    # FastAPI will stream this efficiently
-    return FileResponse(path, media_type="video/mp4", filename=path.name)
+    return {"job_id": job_id, "video_url": presign_get(vkey, expires_seconds=3600)}
