@@ -1,6 +1,17 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
+
+# DB (already in your stack)
 sqlalchemy==2.0.34
 psycopg2-binary==2.9.9
+
+# Upload handling
 python-multipart==0.0.9
 pydantic==2.8.2
+
+# --- Extraction dependencies ---
+opencv-python-headless==4.10.0.84
+numpy==2.0.2
+
+# --- YOLO (Ultralytics) ---
+ultralytics==8.4.5

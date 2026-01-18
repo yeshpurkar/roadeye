@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 
 const ASSET_OPTIONS = [
   { key: "roadside_signs", label: "Roadside Signs (STOP, SPEED, etc)" },
@@ -8,13 +8,36 @@ const ASSET_OPTIONS = [
   { key: "light_poles", label: "Light Poles" },
 ];
 
-const API_BASE = "http://localhost:8000"; // backend
+function getApiBase() {
+  // Optional: set in frontend/.env as:
+  // VITE_API_BASE=http://localhost:8000
+  return import.meta.env.VITE_API_BASE || "http://localhost:8000";
+}
 
 function fileKey(f) {
   return `${f.name}_${f.size}_${f.lastModified}`;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function readError(res) {
+  const text = await res.text();
+  if (!text) return `HTTP ${res.status}`;
+  try {
+    const j = JSON.parse(text);
+    if (typeof j?.detail === "string") return j.detail;
+    if (typeof j?.error === "string") return j.error;
+    return JSON.stringify(j);
+  } catch {
+    return text;
+  }
+}
+
 export default function App() {
+  const API_BASE = useMemo(() => getApiBase(), []);
+
   const [step, setStep] = useState(1);
 
   const [videos, setVideos] = useState([]);
@@ -27,17 +50,22 @@ export default function App() {
   });
 
   // status per fileKey: { status, jobId, message }
-  const [jobs, setJobs] = useState({}); 
+  const [jobs, setJobs] = useState({});
   const [isStarting, setIsStarting] = useState(false);
+
+  // Polling controls (optional, but useful for overnight)
+  const [pollingEnabled, setPollingEnabled] = useState(true);
+  const pollCancelRef = useRef(false);
 
   const selectedAssets = useMemo(
     () => Object.entries(assets).filter(([, v]) => v).map(([k]) => k),
     [assets]
   );
 
-  // 1) Append + dedupe
   function onPickVideos(fileList) {
-    const arr = Array.from(fileList || []).filter((f) => f.type.startsWith("video/"));
+    const arr = Array.from(fileList || []).filter((f) =>
+      (f.type || "").startsWith("video/")
+    );
     if (arr.length === 0) return;
 
     setVideos((prev) => {
@@ -46,7 +74,6 @@ export default function App() {
       return Array.from(map.values());
     });
 
-    // initialize job rows (Queued) if not present
     setJobs((prev) => {
       const next = { ...prev };
       for (const f of arr) {
@@ -89,63 +116,197 @@ export default function App() {
     }));
   }
 
-  // 3) Connect Start to backend: create job + upload video
-  async function startUpload() {
+  async function fetchJob(jobId) {
+    const res = await fetch(`${API_BASE}/jobs/${jobId}`);
+    if (!res.ok) {
+      const err = await readError(res);
+      throw new Error(`Fetch job failed: ${err}`);
+    }
+    return await res.json();
+  }
+
+  async function pollUntilTerminal({ jobId, k, maxSeconds = 12 * 60 * 60 }) {
+    // Default maxSeconds = 12 hours (overnight-friendly)
+    const start = Date.now();
+
+    while (true) {
+      if (pollCancelRef.current) return;
+
+      const elapsedSec = Math.floor((Date.now() - start) / 1000);
+      if (elapsedSec > maxSeconds) {
+        setJob(k, {
+          status: "Timed out",
+          message: `Polling timed out after ${Math.floor(maxSeconds / 3600)}h (job may still be running)`,
+          jobId,
+        });
+        return;
+      }
+
+      let job;
+      try {
+        job = await fetchJob(jobId);
+      } catch (e) {
+        // transient failure; keep polling
+        setJob(k, { status: "Polling…", message: `Retrying… (${elapsedSec}s)`, jobId });
+        await sleep(2000);
+        continue;
+      }
+
+      const status = job?.status || "unknown";
+
+      if (status === "done") {
+        const resultsCount = Array.isArray(job?.results) ? job.results.length : 0;
+        setJob(k, {
+          status: "Done",
+          message: `Status: done | Results: ${resultsCount}${job?.results_path ? ` | ${job.results_path}` : ""}`,
+          jobId,
+        });
+        return;
+      }
+
+      if (status === "error") {
+        setJob(k, {
+          status: "Error",
+          message: job?.error || "Processing error",
+          jobId,
+        });
+        return;
+      }
+
+      // queued / processing / uploaded etc.
+      setJob(k, {
+        status: status === "queued" ? "Queued…" : status === "processing" ? "Processing…" : status,
+        message: `Status: ${status} (${elapsedSec}s)`,
+        jobId,
+      });
+
+      // Poll interval: 2s while queued, 3s while processing (gentler)
+      const wait = status === "queued" ? 2000 : 3000;
+      await sleep(wait);
+    }
+  }
+
+  async function runOneVideoPipeline(file) {
+    const k = fileKey(file);
+
+    try {
+      // --- Create job ---
+      setJob(k, { status: "Creating job…", message: "", jobId: null });
+
+      const createRes = await fetch(`${API_BASE}/jobs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          assets: selectedAssets,
+          filename: file.name,
+        }),
+      });
+
+      if (!createRes.ok) {
+        const err = await readError(createRes);
+        setJob(k, { status: "Error", message: `Job create failed: ${err}` });
+        return;
+      }
+
+      const createData = await createRes.json();
+      const jobId = createData.job_id;
+
+      // --- Upload video ---
+      setJob(k, { status: "Uploading…", jobId, message: "" });
+
+      const form = new FormData();
+      form.append("file", file);
+
+      const upRes = await fetch(`${API_BASE}/jobs/${jobId}/upload`, {
+        method: "POST",
+        body: form,
+      });
+
+      if (!upRes.ok) {
+        const err = await readError(upRes);
+        setJob(k, { status: "Error", message: `Upload failed: ${err}`, jobId });
+        return;
+      }
+
+      // --- Enqueue processing ---
+      setJob(k, { status: "Enqueueing…", message: "", jobId });
+
+      const procRes = await fetch(`${API_BASE}/jobs/${jobId}/process`, {
+        method: "POST",
+      });
+
+      if (!procRes.ok) {
+        const err = await readError(procRes);
+        setJob(k, { status: "Error", message: `Enqueue failed: ${err}`, jobId });
+        return;
+      }
+
+      const procData = await procRes.json();
+      const procStatus = procData?.status || "queued";
+
+      setJob(k, {
+        status: procStatus === "queued" ? "Queued…" : procStatus,
+        message: `Status: ${procStatus}`,
+        jobId,
+      });
+
+      // --- Optional: poll until done/error ---
+      if (pollingEnabled) {
+        await pollUntilTerminal({ jobId, k });
+      } else {
+        setJob(k, {
+          status: procStatus === "queued" ? "Queued…" : procStatus,
+          message: "Enqueued. Polling disabled (you can refresh later).",
+          jobId,
+        });
+      }
+    } catch (e) {
+      setJob(k, { status: "Error", message: `Unexpected error: ${e?.message || e}` });
+    }
+  }
+
+  async function startMode1Parallel() {
     if (videos.length === 0) return;
+
     if (selectedAssets.length === 0) {
       alert("Please select at least one asset type.");
       return;
     }
 
     setIsStarting(true);
+    pollCancelRef.current = false;
 
     try {
-      // Upload each video as its own job (simplest MVP)
-      for (const f of videos) {
-        const k = fileKey(f);
+      const batch = [...videos];
 
-        setJob(k, { status: "Creating job…", message: "" });
-
-        // Create job
-        const createRes = await fetch(`${API_BASE}/jobs`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            assets: selectedAssets,
-            filename: f.name,
-          }),
-        });
-
-        if (!createRes.ok) {
-          const txt = await createRes.text();
-          setJob(k, { status: "Error", message: `Job create failed: ${txt}` });
-          continue;
-        }
-
-        const { job_id } = await createRes.json();
-        setJob(k, { status: "Uploading…", jobId: job_id });
-
-        // Upload video
-        const form = new FormData();
-        form.append("file", f);
-
-        const upRes = await fetch(`${API_BASE}/jobs/${job_id}/upload`, {
-          method: "POST",
-          body: form,
-        });
-
-        if (!upRes.ok) {
-          const txt = await upRes.text();
-          setJob(k, { status: "Error", message: `Upload failed: ${txt}`, jobId: job_id });
-          continue;
-        }
-
-        setJob(k, { status: "Uploaded", message: "Ready for processing", jobId: job_id });
-      }
-    } catch (e) {
-      alert(`Unexpected error: ${e?.message || e}`);
+      // Kick off ALL pipelines in parallel
+      // Note: browser/network can choke if you select tons of huge files at once.
+      await Promise.allSettled(batch.map((f) => runOneVideoPipeline(f)));
     } finally {
       setIsStarting(false);
+    }
+  }
+
+  function stopPolling() {
+    pollCancelRef.current = true;
+  }
+
+  function resumePolling() {
+    pollCancelRef.current = false;
+
+    // Re-start polling for any jobs that are in-flight
+    // (This doesn't restart uploads; it just checks statuses for jobs that already exist)
+    for (const v of videos) {
+      const k = fileKey(v);
+      const row = jobs[k];
+      const jobId = row?.jobId;
+      if (!jobId) continue;
+
+      const st = (row?.status || "").toLowerCase();
+      const isTerminal = st.includes("done") || st.includes("error") || st.includes("timed out");
+      if (isTerminal) continue;
+
+      pollUntilTerminal({ jobId, k }).catch(() => {});
     }
   }
 
@@ -203,6 +364,13 @@ export default function App() {
               </button>
             </div>
           )}
+
+          <div style={{ marginTop: 16, color: "#777", fontSize: 13 }}>
+            Backend:{" "}
+            <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+              {API_BASE}
+            </span>
+          </div>
         </div>
       ) : (
         <div style={styles.card}>
@@ -248,7 +416,7 @@ export default function App() {
                 <label key={opt.key} style={styles.assetRow}>
                   <input
                     type="checkbox"
-                    checked={assets[opt.key]}
+                    checked={!!assets[opt.key]}
                     onChange={() => toggleAsset(opt.key)}
                   />
                   <span style={{ marginLeft: 10 }}>{opt.label}</span>
@@ -257,7 +425,44 @@ export default function App() {
             </div>
           </div>
 
-          {/* 2) Status table */}
+          <div style={styles.section}>
+            <div style={styles.miniTitle}>Overnight controls</div>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <input
+                  type="checkbox"
+                  checked={pollingEnabled}
+                  onChange={(e) => setPollingEnabled(e.target.checked)}
+                  disabled={isStarting}
+                />
+                Enable polling (updates statuses live)
+              </label>
+
+              <button
+                style={styles.secondaryBtn}
+                onClick={stopPolling}
+                disabled={!pollingEnabled}
+                title="Stops live polling (uploads & processing keep going)"
+              >
+                Stop Polling
+              </button>
+
+              <button
+                style={styles.secondaryBtn}
+                onClick={resumePolling}
+                disabled={!pollingEnabled}
+                title="Resumes polling for in-flight jobs"
+              >
+                Resume Polling
+              </button>
+            </div>
+
+            <div style={styles.small}>
+              Tip: for overnight runs, you can disable polling after everything is enqueued to reduce browser/network load.
+              Processing continues on the worker.
+            </div>
+          </div>
+
           <div style={styles.section}>
             <div style={styles.miniTitle}>Upload status</div>
             <div style={styles.statusBox}>
@@ -299,13 +504,17 @@ export default function App() {
                 opacity: isStarting ? 0.7 : 1,
                 cursor: isStarting ? "not-allowed" : "pointer",
               }}
-              onClick={startUpload}
-              disabled={videos.length === 0 || isStarting}
+              onClick={startMode1Parallel}
+              disabled={videos.length === 0 || isStarting || selectedAssets.length === 0}
+              title={selectedAssets.length === 0 ? "Select at least one asset type" : ""}
             >
-              {isStarting ? "Starting…" : "Start (upload to backend)"}
+              {isStarting ? "Starting…" : "Start (parallel upload + enqueue)"}
             </button>
+
             <div style={styles.small}>
-              This will create one job per video and upload files to your backend at {API_BASE}.
+              Mode 1: Browser uploads the videos. Backend enqueues work; the worker processes jobs from the queue.
+              <br />
+              Backend: {API_BASE}
             </div>
           </div>
         </div>
@@ -372,7 +581,7 @@ const styles = {
   selectedTitle: { fontWeight: 600, marginBottom: 8 },
 
   card: {
-    maxWidth: 820,
+    maxWidth: 900,
     margin: "4vh auto 0",
     border: "1px solid #eee",
     borderRadius: 18,
