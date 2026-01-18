@@ -15,3 +15,5 @@ storage/
 
 # Vite
 .vite/
+
+*.code-workspace
