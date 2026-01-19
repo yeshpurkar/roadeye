@@ -19,3 +19,11 @@ storage/
 *.code-workspace
 *.mp4
 *.mov
+
+# Python virtualenvs
+.venv/
+**/.venv/
+venv/
+**/venv/
+__pycache__/
+*.pyc
