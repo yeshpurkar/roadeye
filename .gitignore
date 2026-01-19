@@ -17,3 +17,5 @@ storage/
 .vite/
 
 *.code-workspace
+*.mp4
+*.mov
