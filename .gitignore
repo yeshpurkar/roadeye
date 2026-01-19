@@ -27,3 +27,7 @@ venv/
 **/venv/
 __pycache__/
 *.pyc
+
+# local venv
+backend/.venv/
+.venv/
